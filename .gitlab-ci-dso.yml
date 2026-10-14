@@ -1,0 +1,44 @@
+# Pipeline DSO — construit l'image avec Kaniko et la pousse dans Harbor.
+# Modèle : le gabarit deploiement-cpin + IA-Generative/ocr-api/.gitlab-ci-dso.yml.
+# Il n'y a pas de chart dans ce dépôt applicatif : la version vient du manifest
+# release-please (`-rc` sur la branche de pré-release), à jour puisque la
+# synchro GitLab de `cd.yml` passe après le job `release`.
+include:
+  - project: $CATALOG_PATH
+    file:
+      - vault-ci.yml
+      - kaniko-ci.yml
+    ref: main
+
+variables:
+  REGISTRY_URL: "${REGISTRY_HOST}/${PROJECT_PATH}"
+
+stages:
+  - read-secret
+  - docker-build
+
+# Obligatoire : sans lecture des secrets de chaîne, le build échoue.
+read_secret:
+  stage: read-secret
+  extends:
+    - .vault:read_secret
+
+docker-build:
+  stage: docker-build
+  extends:
+    - .kaniko:build-push
+  variables:
+    DOCKERFILE: "Dockerfile"
+    WORKING_DIR: "."
+    IMAGE_NAMES: ""   # calculé dans before_script
+    EXTRA_BUILD_ARGS: "--build-arg DOCKERHUB_MIRROR_URL=${DOCKERHUB_MIRROR_URL}"
+  before_script:
+    - |
+      MANIFEST=.release-please-manifest.json
+      [ "$CI_COMMIT_REF_NAME" != main ] && [ -f .release-please-manifest-rc.json ] && MANIFEST=.release-please-manifest-rc.json
+      APP_VERSION=$(sed -n 's/.*"\.": *"\([^"]*\)".*/\1/p' "$MANIFEST")
+      [ -n "$APP_VERSION" ] || { echo "APP_VERSION introuvable"; exit 1; }
+      # Tags uniques (bonnes pratiques CPiN) : pas de tag de branche réécrit.
+      # Le refugue appVersion est ce que le chart d'infra consomme par défaut.
+      export IMAGE_NAMES="translate-rt:${CI_COMMIT_SHORT_SHA} translate-rt:${APP_VERSION}"
+      echo "Building with tags: $IMAGE_NAMES"

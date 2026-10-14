@@ -1,0 +1,69 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# En CD on met en file, on n'annule JAMAIS : interrompre une release est pire que l'attendre.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Idempotent : tourne à chaque push, ne publie que s'il y a une release à faire.
+  # `release-please-manifest` porte la version consommée par le pipeline DSO
+  # (pas de chart dans ce dépôt applicatif).
+  release:
+    uses: dnum-mi/fabnum-cicd/.github/workflows/release-app.yml@v0
+    if: ${{ github.ref_name == 'main' }}
+    permissions:
+      issues: write
+      pull-requests: write
+      contents: write
+    with:
+      RELEASE_CONFIG_FILE: release-please-config.json
+      RELEASE_MANIFEST_FILE: .release-please-manifest.json
+      AUTOMERGE_PRERELEASE: false
+      AUTOMERGE_RELEASE: false
+      RELEASE_BRANCH: main
+    # Credential cross-dépôt (PAT) : déclenche la CI des PR de release, là où
+    # GITHUB_TOKEN ne le peut pas. Voir docs/okf/decisions/github-app-vs-pat.md.
+    secrets:
+      GH_PAT: ${{ secrets.GH_PAT }}
+
+  # Synchronise le dépôt vers GitLab : déclenche le pipeline DSO qui construit
+  # l'image dans Harbor. AppVersion = release-please, à jour car `release` est passé avant.
+  sync-cpin:
+    uses: dnum-mi/fabnum-cicd/.github/workflows/sync-cpin.yml@v0
+    needs: [release]
+    if: ${{ needs.release.outputs.release-created == 'true' }}
+    permissions: {}
+    with:
+      # `vars.` et non `secrets.` : un secret ne peut pas être passé dans `with:`.
+      GITLAB_URL: ${{ vars.GITLAB_URL }}
+      GIT_MIRROR_PROJECT_ID: ${{ vars.GITLAB_MIRROR_ID }}
+      REPOSITORY_NAME: ${{ vars.GITLAB_PROJECT_NAME }}
+      BRANCH_TO_SYNC: ${{ github.ref_name }}
+      SYNC_ALL: false
+    secrets:
+      GIT_MIRROR_TOKEN: ${{ secrets.GITLAB_TRIGGER_TOKEN }}
+
+  # Rien n'est fait sur ce dépôt applicatif : le bump du chart se fait dans le
+  # dépôt d'infra séparé via dispatch. L'image absente de Harbor (pipeline DSO
+  # asynchrone) → AUTOMERGE_*: false, la PR d'infra est mergée par l'humain.
+  dispatch-chart:
+    uses: dnum-mi/fabnum-cicd/.github/workflows/dispatch-helm-chart.yml@v0
+    needs: [release, sync-cpin]
+    if: ${{ needs.release.outputs.release-created == 'true' }}
+    permissions: {}
+    with:
+      CHART_REPO: IA-Generative/translate-rt-infra
+      CHART_DIR: helm
+      CHART_NAME: translate-rt
+      APP_VERSION: ${{ needs.release.outputs.version }}
+      AUTOMERGE_PRERELEASE: false
+      AUTOMERGE_RELEASE: false
+    secrets:
+      # Le PAT doit avoir accès au dépôt d'infra, pas seulement à celui-ci.
+      GH_PAT: ${{ secrets.GH_PAT }}
